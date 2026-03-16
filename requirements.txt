@@ -1,0 +1,12 @@
+numpy>=2.0
+pandas>=2.2
+scipy>=1.14
+matplotlib>=3.9
+scikit-learn>=1.5
+seaborn>=0.13
+plotly>=5.24
+wfdb>=4.1
+biosppy>=2.2
+jupyter>=1.1
+ipywidgets>=8.1
+pytest>=8.3
