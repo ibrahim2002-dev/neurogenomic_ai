@@ -206,3 +206,156 @@ class DataPipeline:
             f'FROM {table_name} ORDER BY sample_index'
         )
         return self.load_query_from_database(query, db_path=db_path)
+
+    def download_genomic_geo(
+        self,
+        geo_accession='GSE55750',
+        db_path=None,
+        table_name='genomic_data',
+        if_exists='replace',
+        max_genes=100,
+    ):
+        """
+        Download gene expression data from NCBI GEO series matrix.
+        Source: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=<geo_accession>
+        FTP:    https://ftp.ncbi.nlm.nih.gov/geo/series/
+
+        Parses the gzip-compressed series matrix (tab-separated expression table)
+        and stores up to `max_genes` genes as columns with samples as rows.
+        Falls back gracefully to the caller on download or parse failure.
+        """
+        import urllib.request
+        import gzip as _gzip
+
+        # Build FTP series path: e.g. GSE55750 -> GSE55nnn
+        digits = ''.join(filter(str.isdigit, geo_accession))
+        prefix_base = digits[:-3] if len(digits) > 3 else ''
+        db_type = geo_accession.rstrip('0123456789')
+        series_prefix = db_type + (prefix_base + 'nnn' if prefix_base else 'nnn')
+        url = (
+            f'https://ftp.ncbi.nlm.nih.gov/geo/series/{series_prefix}/'
+            f'{geo_accession}/matrix/{geo_accession}_series_matrix.txt.gz'
+        )
+
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            with _gzip.open(resp, 'rt', encoding='utf-8', errors='ignore') as gz:
+                in_table = False
+                header = None
+                data_rows = []
+                for line in gz:
+                    line = line.rstrip('\n')
+                    if '!series_matrix_table_begin' in line:
+                        in_table = True
+                        continue
+                    if '!series_matrix_table_end' in line:
+                        break
+                    if not in_table or line.startswith('!'):
+                        continue
+                    parts = line.split('\t')
+                    if header is None:
+                        header = parts
+                        continue
+                    data_rows.append(parts)
+                    if len(data_rows) >= max_genes:
+                        break
+
+        if not data_rows or header is None:
+            raise ValueError(f'No expression data found in GEO {geo_accession} matrix file.')
+
+        gene_ids = [row[0].strip('"') for row in data_rows]
+        n_samples = len(header) - 1
+        expr = []
+        for row in data_rows:
+            vals = []
+            for v in row[1:n_samples + 1]:
+                try:
+                    vals.append(float(v))
+                except (ValueError, TypeError):
+                    vals.append(np.nan)
+            expr.append(vals)
+        expr = np.array(expr, dtype=float)  # (n_genes, n_samples)
+
+        sample_ids = [h.strip('"') for h in header[1:n_samples + 1]]
+        safe_name = lambda g: 'gene_' + g.strip('"').replace('-', '_').replace('.', '_')
+        cols = {safe_name(g): expr[i] for i, g in enumerate(gene_ids)}
+        df = pd.DataFrame(cols)
+        df.insert(0, 'sample_id', sample_ids)
+        df['geo_accession'] = geo_accession
+        df['source'] = 'ncbi_geo'
+
+        if db_path is not None:
+            db_file = self._resolve_db_path(db_path)
+            db_file.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(db_file) as conn:
+                df.to_sql(table_name, conn, if_exists=if_exists, index=False)
+
+        return df
+
+    def download_behavioral_physionet(
+        self,
+        database='clas',
+        record_name='001',
+        db_path=None,
+        table_name='behavioral_data',
+        if_exists='replace',
+        window_sec=30,
+    ):
+        """
+        Download behavioral/cognitive task data from PhysioNet CLAS database.
+        Source: https://physionet.org/content/clas/1.0.0/
+
+        Downloads the physiological signals for a CLAS record, maps any
+        available annotations to time windows, and computes per-window
+        mean/std features for each channel as behavioral descriptors.
+        """
+        if wfdb is None:
+            raise ImportError('wfdb is not installed. Run: pip install wfdb')
+
+        record = wfdb.rdrecord(record_name, pn_dir=database)
+        fs = float(record.fs)
+        p_signal = record.p_signal
+        sig_names = record.sig_name or [f'ch_{i}' for i in range(p_signal.shape[1])]
+
+        # Attempt to load task/behavioral annotations
+        ann_map = {}
+        for ext in ('atr', 'csv', 'txt'):
+            try:
+                ann = wfdb.rdann(record_name, ext, pn_dir=database)
+                labels = getattr(ann, 'aux_note', None) or ann.symbol
+                for s, lbl in zip(ann.sample, labels):
+                    ann_map[int(s)] = str(lbl).strip()
+                break
+            except Exception:
+                continue
+
+        win = max(1, int(fs * window_sec))
+        rows = []
+        current_label = 'unknown'
+        ann_samples = sorted(ann_map)
+        for start in range(0, len(p_signal) - win + 1, win):
+            for s in ann_samples:
+                if start <= s < start + win:
+                    current_label = ann_map[s]
+            chunk = p_signal[start:start + win]
+            row = {
+                'task_id': start // win,
+                'window_start_sample': int(start),
+                'time_sec': start / fs,
+                'record_name': record_name,
+                'database': database,
+                'behavioral_label': current_label,
+            }
+            for i, name in enumerate(sig_names):
+                col_vals = chunk[:, i].astype(float)
+                row[f'{name}_mean'] = float(np.nanmean(col_vals))
+                row[f'{name}_std'] = float(np.nanstd(col_vals))
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        if db_path is not None:
+            db_file = self._resolve_db_path(db_path)
+            db_file.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(db_file) as conn:
+                df.to_sql(table_name, conn, if_exists=if_exists, index=False)
+
+        return df

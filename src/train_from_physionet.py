@@ -7,11 +7,48 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 
+try:
+    import wfdb
+except ImportError:
+    wfdb = None
+
 from data_pipeline import DataPipeline
 from feature_extraction import HRVExtractor
 from model import CognitiveStateClassifier
 from preprocessing import ECGPreprocessor
 from signal_separation import ComponentAnalyzer, SignalSeparator
+
+
+DATABASE_ALIASES = {
+    'adecg': 'adfecgdb',
+    'longecgdb': 'ltdb',
+    'nifecgdb': 'nifecgdb',
+}
+
+
+def _resolve_database_name(name: str) -> str:
+    return DATABASE_ALIASES.get(name.lower().strip(), name.lower().strip())
+
+
+def _resolve_record_name(database: str, explicit_record: str | None) -> str:
+    if explicit_record:
+        return explicit_record
+    if wfdb is None:
+        return '100'
+    try:
+        records = wfdb.get_record_list(database)
+        if records:
+            return records[0]
+    except Exception:
+        pass
+    return '100'
+
+
+def _pick_best_numeric_column(df: pd.DataFrame, excluded: set[str]) -> str:
+    candidates = [c for c in df.columns if c not in excluded and pd.api.types.is_numeric_dtype(df[c])]
+    if not candidates:
+        raise ValueError('No numeric ECG signal column found in ingested PhysioNet table.')
+    return max(candidates, key=lambda c: int(df[c].notna().sum()))
 
 
 def _auto_pick_signal_column(df: pd.DataFrame) -> str:
@@ -21,11 +58,10 @@ def _auto_pick_signal_column(df: pd.DataFrame) -> str:
         'record_name',
         'database',
         'sampling_rate',
+        'source_database',
+        'source_record',
     }
-    numeric_cols = [c for c in df.columns if c not in excluded and pd.api.types.is_numeric_dtype(df[c])]
-    if not numeric_cols:
-        raise ValueError('No numeric ECG signal column found in ingested PhysioNet table.')
-    return numeric_cols[0]
+    return _pick_best_numeric_column(df, excluded)
 
 
 def _numeric_signal_columns(df: pd.DataFrame) -> list[str]:
@@ -35,6 +71,8 @@ def _numeric_signal_columns(df: pd.DataFrame) -> list[str]:
         'record_name',
         'database',
         'sampling_rate',
+        'source_database',
+        'source_record',
     }
     return [c for c in df.columns if c not in excluded and pd.api.types.is_numeric_dtype(df[c])]
 
@@ -81,12 +119,29 @@ def _build_default_behavioral_table(n_rows: int) -> pd.DataFrame:
 
 def main():
     parser = argparse.ArgumentParser(description='Download PhysioNet ECG, process, separate signals, extract HRV features, and train NN model.')
-    parser.add_argument('--database', default='mitdb', help='PhysioNet dataset name (e.g., mitdb).')
-    parser.add_argument('--record', default='100', help='Record identifier in the selected PhysioNet dataset.')
+    parser.add_argument(
+        '--databases',
+        default='nifecgdb,longecgdb,adecg',
+        help='Comma-separated PhysioNet dataset aliases/names to ingest (default: nifecgdb,longecgdb,adecg).',
+    )
+    parser.add_argument(
+        '--database',
+        default=None,
+        help='Optional single dataset name; if provided, overrides --databases.',
+    )
+    parser.add_argument(
+        '--record',
+        default=None,
+        help='Optional record identifier applied to all selected databases. If omitted, first available record is used per database.',
+    )
     parser.add_argument('--signal-column', default=None, help='Specific ECG column to use after ingestion.')
     parser.add_argument('--window-sec', type=int, default=10, help='Window length in seconds for HRV extraction.')
-    parser.add_argument('--genomic-csv', default=None, help='Optional genomic CSV path to load into genomic_data table.')
-    parser.add_argument('--behavioral-csv', default=None, help='Optional behavioral CSV path to load into behavioral_data table.')
+    parser.add_argument('--genomic-csv', default=None, help='Optional genomic CSV path; overrides GEO download.')
+    parser.add_argument('--genomic-db', default='GSE55750', help='NCBI GEO accession for genomic data (default: GSE55750). See https://www.ncbi.nlm.nih.gov/geo/')
+    parser.add_argument('--behavioral-csv', default=None, help='Optional behavioral CSV path; overrides PhysioNet CLAS download.')
+    parser.add_argument('--behavioral-db', default='clas', help='PhysioNet behavioral database (default: clas). See https://physionet.org/content/clas/1.0.0/')
+    parser.add_argument('--behavioral-record', default='001', help='Record identifier within behavioral-db (default: 001).')
+    parser.add_argument('--no-real-data', action='store_true', help='Skip external downloads and use synthetic genomic/behavioral data.')
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -96,27 +151,84 @@ def main():
 
     pipeline = DataPipeline(data_dir=root / 'data', db_path=db_path)
 
-    ingest_info = pipeline.ingest_physionet_record_to_database(
-        database=args.database,
-        record_name=args.record,
-        table_name='physio_data',
-        db_path=db_path,
-        if_exists='replace',
-    )
+    if args.database:
+        requested_databases = [args.database]
+    else:
+        requested_databases = [d.strip() for d in args.databases.split(',') if d.strip()]
+    if not requested_databases:
+        raise ValueError('No databases were provided. Pass --database or --databases.')
 
-    raw_df = pipeline.load_table_from_database('physio_data', db_path=db_path)
+    raw_parts = []
+    source_rows = []
+    for db_name in requested_databases:
+        resolved_db = _resolve_database_name(db_name)
+        record_name = _resolve_record_name(resolved_db, args.record)
+        table_name = f'physio_{resolved_db}_{str(record_name).replace("/", "_").replace("-", "_")}'
 
+        pipeline.ingest_physionet_record_to_database(
+            database=resolved_db,
+            record_name=record_name,
+            table_name=table_name,
+            db_path=db_path,
+            if_exists='replace',
+        )
+        part = pipeline.load_table_from_database(table_name, db_path=db_path)
+        part['source_database'] = resolved_db
+        part['source_record'] = str(record_name)
+        raw_parts.append(part)
+        source_rows.append({'database': resolved_db, 'record': str(record_name), 'rows': int(len(part))})
+
+    raw_df = pd.concat(raw_parts, ignore_index=True, sort=False)
+    pipeline.store_dataframe_in_database(raw_df, 'physio_data', db_path=db_path, if_exists='replace')
+
+    # --- Genomic data: NCBI GEO (default GSE55750) ---
+    # Dataset URL: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE55750
     if args.genomic_csv:
         genomic_df = pd.read_csv(args.genomic_csv)
+        pipeline.store_dataframe_in_database(genomic_df, 'genomic_data', db_path=db_path, if_exists='replace')
+    elif not args.no_real_data:
+        print(f'Downloading genomic data from NCBI GEO ({args.genomic_db}) ...')
+        print(f'  Source: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={args.genomic_db}')
+        try:
+            genomic_df = pipeline.download_genomic_geo(
+                geo_accession=args.genomic_db,
+                db_path=db_path,
+                table_name='genomic_data',
+                if_exists='replace',
+            )
+            print(f'  Downloaded genomic rows: {len(genomic_df)}, genes: {len([c for c in genomic_df.columns if c.startswith("gene_")])}')
+        except Exception as exc:
+            print(f'  Warning: GEO download failed ({exc}). Using synthetic genomic data.')
+            genomic_df = _build_default_genomic_table(max(20, len(raw_df) // 1000))
+            pipeline.store_dataframe_in_database(genomic_df, 'genomic_data', db_path=db_path, if_exists='replace')
     else:
         genomic_df = _build_default_genomic_table(max(20, len(raw_df) // 1000))
-    pipeline.store_dataframe_in_database(genomic_df, 'genomic_data', db_path=db_path, if_exists='replace')
+        pipeline.store_dataframe_in_database(genomic_df, 'genomic_data', db_path=db_path, if_exists='replace')
 
+    # --- Behavioral data: PhysioNet CLAS (Cognitive Load, Affect and Stress) ---
+    # Dataset URL: https://physionet.org/content/clas/1.0.0/
     if args.behavioral_csv:
         behavioral_df = pd.read_csv(args.behavioral_csv)
+        pipeline.store_dataframe_in_database(behavioral_df, 'behavioral_data', db_path=db_path, if_exists='replace')
+    elif not args.no_real_data:
+        print(f'Downloading behavioral data from PhysioNet {args.behavioral_db}/{args.behavioral_record} ...')
+        print(f'  Source: https://physionet.org/content/clas/1.0.0/')
+        try:
+            behavioral_df = pipeline.download_behavioral_physionet(
+                database=args.behavioral_db,
+                record_name=args.behavioral_record,
+                db_path=db_path,
+                table_name='behavioral_data',
+                if_exists='replace',
+            )
+            print(f'  Downloaded behavioral rows: {len(behavioral_df)}')
+        except Exception as exc:
+            print(f'  Warning: CLAS download failed ({exc}). Using synthetic behavioral data.')
+            behavioral_df = _build_default_behavioral_table(max(20, len(raw_df) // 1000))
+            pipeline.store_dataframe_in_database(behavioral_df, 'behavioral_data', db_path=db_path, if_exists='replace')
     else:
         behavioral_df = _build_default_behavioral_table(max(20, len(raw_df) // 1000))
-    pipeline.store_dataframe_in_database(behavioral_df, 'behavioral_data', db_path=db_path, if_exists='replace')
+        pipeline.store_dataframe_in_database(behavioral_df, 'behavioral_data', db_path=db_path, if_exists='replace')
 
     numeric_cols = _numeric_signal_columns(raw_df)
     signal_column = args.signal_column or _auto_pick_signal_column(raw_df)
@@ -124,13 +236,20 @@ def main():
         raise ValueError(f'Signal column {signal_column} is not present in downloaded PhysioNet record.')
 
     secondary_candidates = [c for c in numeric_cols if c != signal_column]
-    secondary_column = secondary_candidates[0] if secondary_candidates else None
+    secondary_column = None
+    if secondary_candidates:
+        secondary_column = max(secondary_candidates, key=lambda c: int(raw_df[c].notna().sum()))
 
     fs = int(float(raw_df['sampling_rate'].iloc[0])) if 'sampling_rate' in raw_df.columns else 360
 
-    primary_signal = raw_df[signal_column].astype(float).to_numpy()
+    primary_signal = pd.to_numeric(raw_df[signal_column], errors='coerce').interpolate(limit_direction='both')
+    if primary_signal.isna().all():
+        raise ValueError(f'No usable samples found in selected primary signal column: {signal_column}')
+    primary_signal = primary_signal.fillna(method='ffill').fillna(method='bfill').to_numpy(dtype=float)
+
     if secondary_column is not None:
-        secondary_signal = raw_df[secondary_column].astype(float).to_numpy()
+        secondary_signal = pd.to_numeric(raw_df[secondary_column], errors='coerce').interpolate(limit_direction='both')
+        secondary_signal = secondary_signal.fillna(method='ffill').fillna(method='bfill').to_numpy(dtype=float)
     else:
         # Create a second mixed channel when only one channel is available
         secondary_signal = np.roll(primary_signal, 1) * 0.95
@@ -259,6 +378,7 @@ def main():
                 'cv_f1_weighted_std': float(np.std(cv_f1_scores)),
                 'cv_accuracy_mean': float(np.mean(cv_acc_scores)),
                 'cv_accuracy_std': float(np.std(cv_acc_scores)),
+                'sources': '; '.join([f"{s['database']}/{s['record']} ({s['rows']} rows)" for s in source_rows]),
             }
         ]
     )
@@ -266,7 +386,10 @@ def main():
     report_path = artifacts_dir / 'model_evaluation_report.csv'
     report.to_csv(report_path, index=False)
 
-    print(f'Downloaded and ingested physiological rows: {len(raw_df)}')
+    print('Downloaded and ingested physiological sources:')
+    for src in source_rows:
+        print(f"  - {src['database']}/{src['record']}: {src['rows']} rows")
+    print(f'Total physiological rows (merged): {len(raw_df)}')
     print(f'Primary signal column: {signal_column}')
     print(f'Secondary signal column: {secondary_column or "synthetic_shifted_copy"}')
     print(f'Maternal component frequency (Hz): {comp_freq[maternal_idx]:.4f}')
