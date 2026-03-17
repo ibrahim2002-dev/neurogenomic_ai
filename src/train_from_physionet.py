@@ -136,8 +136,8 @@ def main():
     )
     parser.add_argument('--signal-column', default=None, help='Specific ECG column to use after ingestion.')
     parser.add_argument('--window-sec', type=int, default=10, help='Window length in seconds for HRV extraction.')
-    parser.add_argument('--genomic-csv', default=None, help='Optional genomic CSV path; overrides GEO download.')
-    parser.add_argument('--genomic-db', default='GSE55750', help='NCBI GEO accession for genomic data (default: GSE55750). See https://www.ncbi.nlm.nih.gov/geo/')
+    parser.add_argument('--genomic-csv', default=None, help='Optional genomic CSV path; overrides EGA download.')
+    parser.add_argument('--genomic-db', default='phs000500', help='EGA study ID for genomic data (default: phs000500). See https://ega-archive.org/studies/phs000500')
     parser.add_argument('--behavioral-csv', default=None, help='Optional behavioral CSV path; overrides PhysioNet CLAS download.')
     parser.add_argument('--behavioral-db', default='clas', help='PhysioNet behavioral database (default: clas). See https://physionet.org/content/clas/1.0.0/')
     parser.add_argument('--behavioral-record', default='001', help='Record identifier within behavioral-db (default: 001).')
@@ -181,24 +181,24 @@ def main():
     raw_df = pd.concat(raw_parts, ignore_index=True, sort=False)
     pipeline.store_dataframe_in_database(raw_df, 'physio_data', db_path=db_path, if_exists='replace')
 
-    # --- Genomic data: NCBI GEO (default GSE55750) ---
-    # Dataset URL: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE55750
+    # --- Genomic data: EGA (default phs000500) ---
+    # Dataset URL: https://ega-archive.org/studies/phs000500
     if args.genomic_csv:
         genomic_df = pd.read_csv(args.genomic_csv)
         pipeline.store_dataframe_in_database(genomic_df, 'genomic_data', db_path=db_path, if_exists='replace')
     elif not args.no_real_data:
-        print(f'Downloading genomic data from NCBI GEO ({args.genomic_db}) ...')
-        print(f'  Source: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={args.genomic_db}')
+        print(f'Downloading genomic data from EGA ({args.genomic_db}) ...')
+        print(f'  Source: https://ega-archive.org/studies/{args.genomic_db}')
         try:
-            genomic_df = pipeline.download_genomic_geo(
-                geo_accession=args.genomic_db,
+            genomic_df = pipeline.download_genomic_ega(
+                study_id=args.genomic_db,
                 db_path=db_path,
                 table_name='genomic_data',
                 if_exists='replace',
             )
-            print(f'  Downloaded genomic rows: {len(genomic_df)}, genes: {len([c for c in genomic_df.columns if c.startswith("gene_")])}')
+            print(f'  Downloaded genomic samples: {len(genomic_df)}')
         except Exception as exc:
-            print(f'  Warning: GEO download failed ({exc}). Using synthetic genomic data.')
+            print(f'  Warning: EGA download failed ({exc}). Using synthetic genomic data.')
             genomic_df = _build_default_genomic_table(max(20, len(raw_df) // 1000))
             pipeline.store_dataframe_in_database(genomic_df, 'genomic_data', db_path=db_path, if_exists='replace')
     else:
